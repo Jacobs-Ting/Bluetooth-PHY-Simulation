@@ -156,7 +156,11 @@ if "FHSS" in app_mode:
     else: st.success(f"✅ **TX SUCCESS!** Carrier hopped to {current_freq} MHz (CH {current_ch}) cleanly.")
 
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-col_m1.metric("Modulation", pkt_info['mod'])
+
+# ★ 這裡修正了調變顯示名稱 ★
+mod_display_name = {'GFSK': 'GFSK', '2DH': 'π/4-DQPSK', '3DH': '8-DPSK'}[pkt_info['mod']]
+col_m1.metric("Modulation", mod_display_name)
+
 col_m2.metric("Effective SNR", f"{effective_snr} dB", delta="-28 dB (Collision)" if is_collision else "Normal", delta_color="inverse" if is_collision else "normal")
 
 if pkt_info['mod'] != 'GFSK':

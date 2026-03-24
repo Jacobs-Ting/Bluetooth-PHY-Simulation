@@ -19,13 +19,13 @@ plt.rcParams.update({
     "font.size": 9,
 })
 
-# Color Palette
-COLOR_SIG_GOOD = "#00E5FF"   # Neon Cyan (Normal Signal)
-COLOR_SIG_BAD = "#FF1744"    # Neon Red (Collision/Error)
-COLOR_ENV = "#FFEA00"        # Neon Yellow (Time Domain Envelope)
-COLOR_SPEC = "#00E676"       # Lime Green (Spectrum Trace)
-COLOR_WIFI = "#D50000"       # Dark Red (Wi-Fi Interference Zone)
-COLOR_SLOT = "#B388FF"       # Light Purple (Time Slot Boundary)
+COLOR_SIG_GOOD = "#00E5FF"   
+COLOR_SIG_BAD = "#FF1744"    
+COLOR_ENV = "#FFEA00"        
+COLOR_SPEC = "#00E676"       
+COLOR_WIFI = "#D50000"       
+COLOR_SLOT = "#B388FF"       
+COLOR_CS = "#FF4081"         # 螢光粉紅 (專屬 Channel Sounding)
 
 # ==========================================
 # Digital Signal Processing (DSP) Module
@@ -79,10 +79,26 @@ def generate_edr_packet(payload_bits, sps=8, psk_type='2DH1'):
     psk_iq, psk_samples = generate_psk(np.concatenate((sync_bits, payload_bits)), psk_type=psk_type, sps=sps)
     return np.concatenate((gfsk_iq, guard_iq, psk_iq)), np.concatenate((gfsk_samples, guard_samples, psk_samples))
 
+# ★ 新增 Channel Sounding Tone 生成器
+def generate_cs_packet(distance_m, freq_mhz, num_symbols, sps=8):
+    gfsk_iq, gfsk_samples = generate_gfsk(generate_bits("PRBS9", 126), sps=sps)
+    
+    # 計算物理相位偏移： Phi = - (4 * pi * d * f) / c (雙向 RTT 相位)
+    c = 299792458.0 
+    freq_hz = freq_mhz * 1e6
+    phase_rad = - (4 * np.pi * distance_m * freq_hz) / c
+    
+    # CS Tone (Unmodulated Carrier)
+    tone_samples = np.exp(1j * phase_rad) * np.ones(num_symbols, dtype=complex)
+    tone_iq = np.repeat(tone_samples, sps) 
+    
+    return np.concatenate((gfsk_iq, tone_iq)), np.concatenate((gfsk_samples, tone_samples)), phase_rad
+
 PACKET_SPECS = {
     'DH1': {'mod': 'GFSK', 'slots': 1, 'max_sym': 216}, 'DH3': {'mod': 'GFSK', 'slots': 3, 'max_sym': 1464}, 'DH5': {'mod': 'GFSK', 'slots': 5, 'max_sym': 2712},
     '2-DH1': {'mod': '2DH', 'slots': 1, 'max_sym': 216}, '2-DH3': {'mod': '2DH', 'slots': 3, 'max_sym': 1468}, '2-DH5': {'mod': '2DH', 'slots': 5, 'max_sym': 2716},
     '3-DH1': {'mod': '3DH', 'slots': 1, 'max_sym': 221}, '3-DH3': {'mod': '3DH', 'slots': 3, 'max_sym': 1472}, '3-DH5': {'mod': '3DH', 'slots': 5, 'max_sym': 2722},
+    'CS (Tone)': {'mod': 'CW', 'slots': 1, 'max_sym': 150}, # ★ 新增 Channel Sounding
 }
 
 # ==========================================
@@ -99,7 +115,7 @@ if 'pseudo_random_seq' not in st.session_state:
 # ==========================================
 st.set_page_config(page_title="Bluetooth RF PHY Studio", layout="wide", initial_sidebar_state="expanded")
 st.title("📶 Bluetooth RF PHY Studio")
-st.markdown("### Advanced Fixed-Frequency & FHSS Coexistence Simulator")
+st.markdown("### Advanced Fixed-Frequency, FHSS & **Channel Sounding** Simulator")
 
 app_mode = st.sidebar.radio("🧪 Instrument Operating Mode", ["1️⃣ Fixed-Frequency (Baseband Spectrum)", "2️⃣ FHSS & Coexistence Simulation"])
 st.sidebar.divider()
@@ -107,9 +123,17 @@ st.sidebar.divider()
 st.sidebar.header("⚙️ RF Parameters")
 packet_type = st.sidebar.selectbox("Packet Type", list(PACKET_SPECS.keys()))
 pkt_info = PACKET_SPECS[packet_type]
-data_pattern = st.sidebar.selectbox("Data Pattern", ["PRBS9 (Random)", "11110000", "10101010"])
+
+# 若為 Channel Sounding，UI 改為顯示距離滑桿
+if pkt_info['mod'] == 'CW':
+    target_distance = st.sidebar.slider("Target Distance (m) [For PBR]", 0.0, 50.0, 5.0, step=0.1)
+    data_pattern = "N/A (CW Tone)"
+    payload_symbols = pkt_info['max_sym']
+else:
+    data_pattern = st.sidebar.selectbox("Data Pattern", ["PRBS9 (Random)", "11110000", "10101010"])
+    payload_symbols = st.sidebar.number_input(f"Payload Symbols (Max: {pkt_info['max_sym']})", min_value=10, max_value=pkt_info['max_sym'], value=pkt_info['max_sym'], step=50)
+
 base_snr = st.sidebar.slider("Ambient SNR (dB)", 10, 50, 35)
-payload_symbols = st.sidebar.number_input(f"Payload Symbols (Max: {pkt_info['max_sym']})", min_value=10, max_value=pkt_info['max_sym'], value=pkt_info['max_sym'], step=50)
 
 is_collision = False
 effective_snr = base_snr
@@ -133,17 +157,24 @@ if "FHSS" in app_mode:
     if enable_wifi and abs(current_freq - wifi_center) <= 10:
         is_collision = True
         effective_snr = 2 
+else:
+    current_freq = 2402 # 預設頻率
 
 # ==========================================
 # Waveform Generation & AWGN
 # ==========================================
 SPS = 8
+phase_rad = 0.0
+
 if pkt_info['mod'] == 'GFSK':
     iq_ideal, sym_ideal = generate_gfsk(generate_bits(data_pattern, payload_symbols), sps=SPS)
 elif pkt_info['mod'] == '2DH':
     iq_ideal, sym_ideal = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 2), sps=SPS, psk_type='2DH1')
-else:
+elif pkt_info['mod'] == '3DH':
     iq_ideal, sym_ideal = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 3), sps=SPS, psk_type='3DH5')
+else:
+    # ★ Channel Sounding Tone
+    iq_ideal, sym_ideal, phase_rad = generate_cs_packet(target_distance, current_freq, payload_symbols, sps=SPS)
 
 iq_signal = add_awgn_noise(iq_ideal, effective_snr)
 sampled_points = add_awgn_noise(sym_ideal, effective_snr)
@@ -157,18 +188,21 @@ if "FHSS" in app_mode:
 
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 
-# ★ 這裡修正了調變顯示名稱 ★
-mod_display_name = {'GFSK': 'GFSK', '2DH': 'π/4-DQPSK', '3DH': '8-DPSK'}[pkt_info['mod']]
-col_m1.metric("Modulation", mod_display_name)
-
+mod_display_name = {'GFSK': 'GFSK', '2DH': 'π/4-DQPSK', '3DH': '8-DPSK', 'CW': 'CS Tone (CW)'}[pkt_info['mod']]
+col_m1.metric("Modulation / Type", mod_display_name)
 col_m2.metric("Effective SNR", f"{effective_snr} dB", delta="-28 dB (Collision)" if is_collision else "Normal", delta_color="inverse" if is_collision else "normal")
 
-if pkt_info['mod'] != 'GFSK':
+if pkt_info['mod'] in ['2DH', '3DH']:
     err_vec = sampled_points[142:] - sym_ideal[142:]
     devm_rms, devm_peak = np.sqrt(np.mean(np.abs(err_vec)**2)) * 100, np.max(np.abs(err_vec)) * 100
     lim_rms, lim_peak = (20.0, 30.0) if pkt_info['mod'] == '2DH' else (13.0, 20.0)
     col_m3.metric("RMS DEVM", f"{devm_rms:.2f} %", delta=f"Limit: {lim_rms}%", delta_color="normal" if devm_rms <= lim_rms else "inverse")
     col_m4.metric("Peak DEVM", f"{devm_peak:.2f} %", delta=f"Limit: {lim_peak}%", delta_color="normal" if devm_peak <= lim_peak else "inverse")
+elif pkt_info['mod'] == 'CW':
+    # 顯示相位的物理測量結果
+    phase_deg = np.degrees(phase_rad) % 360
+    col_m3.metric("Measured Phase", f"{phase_deg:.1f}°")
+    col_m4.metric("Frequency", f"{current_freq} MHz")
 else:
     col_m3.metric("RMS DEVM", "N/A (GFSK)")
     col_m4.metric("Peak DEVM", "N/A (GFSK)")
@@ -182,15 +216,18 @@ col_chart1, col_chart2 = st.columns([1, 1.8])
 
 with col_chart1:
     fig_const, ax_const = plt.subplots(figsize=(5, 5))
-    dot_color = COLOR_SIG_BAD if is_collision else COLOR_SIG_GOOD
+    dot_color = COLOR_SIG_BAD if is_collision else (COLOR_CS if pkt_info['mod'] == 'CW' else COLOR_SIG_GOOD)
     
-    if pkt_info['mod'] != 'GFSK':
+    if pkt_info['mod'] in ['2DH', '3DH']:
         ax_const.set_title(f"PSK Constellation ({data_pattern})", color='white', pad=10)
-        if pkt_info['mod'] == '2DH':
-            ax_const.add_patch(plt.Polygon([[1,0], [0,1], [-1,0], [0,-1]], fill=False, edgecolor='#666666', linestyle='--'))
-            r2 = np.sqrt(2)/2
-            ax_const.add_patch(plt.Polygon([[r2,r2], [-r2,r2], [-r2,-r2], [r2,-r2]], fill=False, edgecolor='#880000', alpha=0.5))
         ax_const.scatter(np.real(sampled_points[142:]), np.imag(sampled_points[142:]), s=10, c=dot_color, alpha=0.8)
+    elif pkt_info['mod'] == 'CW':
+        ax_const.set_title(f"CS Tone Phase Vector (d={target_distance}m)", color='white', pad=10)
+        # 畫單位圓輔助線
+        circle = plt.Circle((0, 0), 1, color='#666666', fill=False, linestyle=':')
+        ax_const.add_patch(circle)
+        # 因為是連續波，跳過前方的 GFSK header，只畫 Tone
+        ax_const.scatter(np.real(sampled_points[126:]), np.imag(sampled_points[126:]), s=25, c=dot_color, alpha=0.9)
     else:
         ax_const.set_title(f"GFSK Constellation ({data_pattern})", color='white', pad=10)
         ax_const.scatter(np.real(sampled_points), np.imag(sampled_points), s=10, c=dot_color, alpha=0.8)
@@ -204,9 +241,15 @@ with col_chart2:
     fig_time, ax_time = plt.subplots(figsize=(10, 4.2))
     ax_time.set_title("Time Domain Envelope (Baseband)", color='white', pad=10)
     time_us = np.arange(len(iq_signal)) / SPS 
-    env_color = COLOR_SIG_BAD if is_collision else COLOR_ENV
+    env_color = COLOR_SIG_BAD if is_collision else (COLOR_CS if pkt_info['mod'] == 'CW' else COLOR_ENV)
     
     ax_time.plot(time_us, np.abs(iq_signal), color=env_color, linewidth=1.5, alpha=0.9)
+    
+    if pkt_info['mod'] == 'CW':
+        ax_time.axvspan(0, 126, facecolor='#444444', alpha=0.4)
+        ax_time.text(60, 1.2, "GFSK Header", color='white', ha='center')
+        ax_time.axvspan(126, time_us[-1], facecolor=COLOR_CS, alpha=0.15)
+        ax_time.text(126 + (time_us[-1]-126)/2, 1.2, "CS CW Tone", color=COLOR_CS, ha='center', fontweight='bold')
     
     slots = pkt_info['slots']
     for i in range(slots + 1):
@@ -231,8 +274,9 @@ if "Fixed-Frequency" in app_mode:
     f = np.fft.fftshift(f)
     Pxx_db = 10 * np.log10(np.fft.fftshift(Pxx) / np.max(Pxx))
     
-    ax_spec.plot(f / 1e6, Pxx_db, color=COLOR_SPEC, linewidth=1.5)
-    ax_spec.fill_between(f / 1e6, Pxx_db, -80, color=COLOR_SPEC, alpha=0.15)
+    spec_col = COLOR_CS if pkt_info['mod'] == 'CW' else COLOR_SPEC
+    ax_spec.plot(f / 1e6, Pxx_db, color=spec_col, linewidth=1.5)
+    ax_spec.fill_between(f / 1e6, Pxx_db, -80, color=spec_col, alpha=0.15)
     
     ax_spec.set_xlim(-3, 3)
     ax_spec.set_ylim(-60, 5)
@@ -258,7 +302,7 @@ else:
             ax_hop.vlines(x=2402+ch, ymin=0, ymax=0.6, color='#2979FF', alpha=alpha, linewidth=3)
 
     if st.session_state.hop_history:
-        h_color = COLOR_SIG_BAD if is_collision else COLOR_SIG_GOOD
+        h_color = COLOR_SIG_BAD if is_collision else (COLOR_CS if pkt_info['mod'] == 'CW' else COLOR_SIG_GOOD)
         ax_hop.vlines(x=current_freq, ymin=0, ymax=1.0, color=h_color, linewidth=5)
         ax_hop.scatter(current_freq, 1.0, color=h_color, s=80, edgecolors='white', zorder=5)
         ax_hop.text(current_freq, 1.08, f"{current_freq} MHz", color=h_color, ha='center', fontweight='bold')

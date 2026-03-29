@@ -25,7 +25,7 @@ COLOR_ENV = "#FFEA00"
 COLOR_SPEC = "#00E676"       
 COLOR_WIFI = "#D50000"       
 COLOR_SLOT = "#B388FF"       
-COLOR_CS = "#FF4081"         # 螢光粉紅 (專屬 Channel Sounding)
+COLOR_CS = "#FF4081"         
 
 # ==========================================
 # Digital Signal Processing (DSP) Module
@@ -36,6 +36,17 @@ def add_awgn_noise(signal, snr_db):
     noise_power = power / snr_linear
     noise = np.sqrt(noise_power / 2) * (np.random.randn(len(signal)) + 1j * np.random.randn(len(signal)))
     return signal + noise
+
+def add_frequency_offset(iq_signal, freq_offset_khz, fs_mhz=8):
+    n = np.arange(len(iq_signal))
+    phase_offset = 2 * np.pi * (freq_offset_khz * 1e3) * (n / (fs_mhz * 1e6))
+    return iq_signal * np.exp(1j * phase_offset)
+
+def compensate_frequency_offset(iq_signal, freq_offset_khz, fs_mhz=8):
+    """模擬接收端演算法：反向旋轉補償 CFO"""
+    n = np.arange(len(iq_signal))
+    phase_offset = -2 * np.pi * (freq_offset_khz * 1e3) * (n / (fs_mhz * 1e6))
+    return iq_signal * np.exp(1j * phase_offset)
 
 def generate_bits(pattern, num_bits):
     if pattern == "11110000": return np.tile([1, 1, 1, 1, 0, 0, 0, 0], (num_bits // 8) + 1)[:num_bits]
@@ -79,26 +90,31 @@ def generate_edr_packet(payload_bits, sps=8, psk_type='2DH1'):
     psk_iq, psk_samples = generate_psk(np.concatenate((sync_bits, payload_bits)), psk_type=psk_type, sps=sps)
     return np.concatenate((gfsk_iq, guard_iq, psk_iq)), np.concatenate((gfsk_samples, guard_samples, psk_samples))
 
-# ★ 新增 Channel Sounding Tone 生成器
 def generate_cs_packet(distance_m, freq_mhz, num_symbols, sps=8):
     gfsk_iq, gfsk_samples = generate_gfsk(generate_bits("PRBS9", 126), sps=sps)
-    
-    # 計算物理相位偏移： Phi = - (4 * pi * d * f) / c (雙向 RTT 相位)
     c = 299792458.0 
     freq_hz = freq_mhz * 1e6
     phase_rad = - (4 * np.pi * distance_m * freq_hz) / c
-    
-    # CS Tone (Unmodulated Carrier)
     tone_samples = np.exp(1j * phase_rad) * np.ones(num_symbols, dtype=complex)
     tone_iq = np.repeat(tone_samples, sps) 
-    
     return np.concatenate((gfsk_iq, tone_iq)), np.concatenate((gfsk_samples, tone_samples)), phase_rad
+
+def measure_freq_dev(bits, sps, snr, cfo_khz):
+    iq_ideal, _ = generate_gfsk(bits, sps=sps)
+    iq_cfo = add_frequency_offset(iq_ideal, cfo_khz, fs_mhz=sps)
+    iq_noisy = add_awgn_noise(iq_cfo, snr)
+    inst_freq = np.diff(np.unwrap(np.angle(iq_noisy))) * (sps * 1e6) / (2 * np.pi)
+    window = np.ones(2) / 2  # 窄窗避免削平波峰
+    inst_freq_smooth = np.convolve(inst_freq, window, mode='valid')
+    cfo_est = np.mean(inst_freq_smooth)
+    df = (np.percentile(inst_freq_smooth, 95) - np.percentile(inst_freq_smooth, 5)) / 2
+    return df / 1000, cfo_est / 1000  
 
 PACKET_SPECS = {
     'DH1': {'mod': 'GFSK', 'slots': 1, 'max_sym': 216}, 'DH3': {'mod': 'GFSK', 'slots': 3, 'max_sym': 1464}, 'DH5': {'mod': 'GFSK', 'slots': 5, 'max_sym': 2712},
     '2-DH1': {'mod': '2DH', 'slots': 1, 'max_sym': 216}, '2-DH3': {'mod': '2DH', 'slots': 3, 'max_sym': 1468}, '2-DH5': {'mod': '2DH', 'slots': 5, 'max_sym': 2716},
     '3-DH1': {'mod': '3DH', 'slots': 1, 'max_sym': 221}, '3-DH3': {'mod': '3DH', 'slots': 3, 'max_sym': 1472}, '3-DH5': {'mod': '3DH', 'slots': 5, 'max_sym': 2722},
-    'CS (Tone)': {'mod': 'CW', 'slots': 1, 'max_sym': 150}, # ★ 新增 Channel Sounding
+    'CS (Tone)': {'mod': 'CW', 'slots': 1, 'max_sym': 150},
 }
 
 # ==========================================
@@ -115,7 +131,7 @@ if 'pseudo_random_seq' not in st.session_state:
 # ==========================================
 st.set_page_config(page_title="Bluetooth RF PHY Studio", layout="wide", initial_sidebar_state="expanded")
 st.title("📶 Bluetooth RF PHY Studio")
-st.markdown("### Advanced Fixed-Frequency, FHSS & **Channel Sounding** Simulator")
+st.markdown("### Advanced Fixed-Frequency, FHSS & Channel Sounding Simulator")
 
 app_mode = st.sidebar.radio("🧪 Instrument Operating Mode", ["1️⃣ Fixed-Frequency (Baseband Spectrum)", "2️⃣ FHSS & Coexistence Simulation"])
 st.sidebar.divider()
@@ -124,7 +140,6 @@ st.sidebar.header("⚙️ RF Parameters")
 packet_type = st.sidebar.selectbox("Packet Type", list(PACKET_SPECS.keys()))
 pkt_info = PACKET_SPECS[packet_type]
 
-# 若為 Channel Sounding，UI 改為顯示距離滑桿
 if pkt_info['mod'] == 'CW':
     target_distance = st.sidebar.slider("Target Distance (m) [For PBR]", 0.0, 50.0, 5.0, step=0.1)
     data_pattern = "N/A (CW Tone)"
@@ -134,6 +149,12 @@ else:
     payload_symbols = st.sidebar.number_input(f"Payload Symbols (Max: {pkt_info['max_sym']})", min_value=10, max_value=pkt_info['max_sym'], value=pkt_info['max_sym'], step=50)
 
 base_snr = st.sidebar.slider("Ambient SNR (dB)", 10, 50, 35)
+cfo_khz = st.sidebar.slider("Carrier Freq Offset (CFO) [kHz]", -150, 150, 40, step=5) # 預設給一點 CFO 看效果
+
+# ★ 新增：接收端演算法控制
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 Receiver Baseband Logic")
+enable_cfo_comp = st.sidebar.checkbox("Enable RX CFO Compensation", value=True, help="Simulates the receiver estimating and removing CFO before analyzing the constellation/phase.")
 
 is_collision = False
 effective_snr = base_snr
@@ -158,26 +179,36 @@ if "FHSS" in app_mode:
         is_collision = True
         effective_snr = 2 
 else:
-    current_freq = 2402 # 預設頻率
+    current_freq = 2402 
 
 # ==========================================
-# Waveform Generation & AWGN
+# Waveform Generation & CFO & AWGN
 # ==========================================
 SPS = 8
 phase_rad = 0.0
 
 if pkt_info['mod'] == 'GFSK':
-    iq_ideal, sym_ideal = generate_gfsk(generate_bits(data_pattern, payload_symbols), sps=SPS)
+    iq_ideal, _, = generate_gfsk(generate_bits(data_pattern, payload_symbols), sps=SPS)
 elif pkt_info['mod'] == '2DH':
-    iq_ideal, sym_ideal = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 2), sps=SPS, psk_type='2DH1')
+    iq_ideal, _ = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 2), sps=SPS, psk_type='2DH1')
 elif pkt_info['mod'] == '3DH':
-    iq_ideal, sym_ideal = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 3), sps=SPS, psk_type='3DH5')
+    iq_ideal, _ = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 3), sps=SPS, psk_type='3DH5')
 else:
-    # ★ Channel Sounding Tone
-    iq_ideal, sym_ideal, phase_rad = generate_cs_packet(target_distance, current_freq, payload_symbols, sps=SPS)
+    iq_ideal, _, phase_rad = generate_cs_packet(target_distance, current_freq, payload_symbols, sps=SPS)
 
-iq_signal = add_awgn_noise(iq_ideal, effective_snr)
-sampled_points = add_awgn_noise(sym_ideal, effective_snr)
+# 加入 CFO
+iq_cfo = add_frequency_offset(iq_ideal, cfo_khz, fs_mhz=SPS)
+
+# 模擬接收端：決定是否補償 CFO
+if enable_cfo_comp:
+    iq_processed = compensate_frequency_offset(iq_cfo, cfo_khz, fs_mhz=SPS)
+else:
+    iq_processed = iq_cfo
+
+# 擷取 Symbol 時機點並加入雜訊
+sym_processed = iq_processed[::SPS]
+iq_signal = add_awgn_noise(iq_processed, effective_snr)
+sampled_points = add_awgn_noise(sym_processed, effective_snr)
 
 # ==========================================
 # Dashboard Metrics
@@ -193,19 +224,30 @@ col_m1.metric("Modulation / Type", mod_display_name)
 col_m2.metric("Effective SNR", f"{effective_snr} dB", delta="-28 dB (Collision)" if is_collision else "Normal", delta_color="inverse" if is_collision else "normal")
 
 if pkt_info['mod'] in ['2DH', '3DH']:
-    err_vec = sampled_points[142:] - sym_ideal[142:]
+    sym_ideal_ref = generate_edr_packet(generate_bits(data_pattern, payload_symbols * (2 if pkt_info['mod']=='2DH' else 3)), sps=SPS, psk_type='2DH1' if pkt_info['mod']=='2DH' else '3DH5')[1]
+    err_vec = sampled_points[142:] - sym_ideal_ref[142:]
     devm_rms, devm_peak = np.sqrt(np.mean(np.abs(err_vec)**2)) * 100, np.max(np.abs(err_vec)) * 100
     lim_rms, lim_peak = (20.0, 30.0) if pkt_info['mod'] == '2DH' else (13.0, 20.0)
-    col_m3.metric("RMS DEVM", f"{devm_rms:.2f} %", delta=f"Limit: {lim_rms}%", delta_color="normal" if devm_rms <= lim_rms else "inverse")
+    
+    devm_label = "RMS DEVM" + (" (Compensated)" if enable_cfo_comp else " (Uncompensated)")
+    col_m3.metric(devm_label, f"{devm_rms:.2f} %", delta=f"Limit: {lim_rms}%", delta_color="normal" if devm_rms <= lim_rms else "inverse")
     col_m4.metric("Peak DEVM", f"{devm_peak:.2f} %", delta=f"Limit: {lim_peak}%", delta_color="normal" if devm_peak <= lim_peak else "inverse")
+    
 elif pkt_info['mod'] == 'CW':
-    # 顯示相位的物理測量結果
     phase_deg = np.degrees(phase_rad) % 360
-    col_m3.metric("Measured Phase", f"{phase_deg:.1f}°")
+    # 若未開補償，顯示的只是平均雜訊結果，提醒使用者
+    phase_label = "Measured Phase" if enable_cfo_comp else "Phase (Distorted by CFO)"
+    col_m3.metric(phase_label, f"{phase_deg:.1f}°")
     col_m4.metric("Frequency", f"{current_freq} MHz")
+    
 else:
-    col_m3.metric("RMS DEVM", "N/A (GFSK)")
-    col_m4.metric("Peak DEVM", "N/A (GFSK)")
+    bits_f1 = generate_bits("11110000", 400)
+    bits_f2 = generate_bits("10101010", 400)
+    df1_khz, cfo_est = measure_freq_dev(bits_f1, SPS, effective_snr, cfo_khz)
+    df2_khz, _ = measure_freq_dev(bits_f2, SPS, effective_snr, cfo_khz)
+    ratio = df2_khz / df1_khz if df1_khz > 0 else 0
+    col_m3.metric("Mod. Char. (Δf2/Δf1)", f"{ratio:.2f}", delta="Limit: >= 0.8", delta_color="normal" if ratio >= 0.8 else "inverse")
+    col_m4.metric("Measured CFO", f"{cfo_est:.1f} kHz", delta=f"Target: {cfo_khz} kHz", delta_color="off")
 
 st.divider()
 
@@ -223,10 +265,8 @@ with col_chart1:
         ax_const.scatter(np.real(sampled_points[142:]), np.imag(sampled_points[142:]), s=10, c=dot_color, alpha=0.8)
     elif pkt_info['mod'] == 'CW':
         ax_const.set_title(f"CS Tone Phase Vector (d={target_distance}m)", color='white', pad=10)
-        # 畫單位圓輔助線
         circle = plt.Circle((0, 0), 1, color='#666666', fill=False, linestyle=':')
         ax_const.add_patch(circle)
-        # 因為是連續波，跳過前方的 GFSK header，只畫 Tone
         ax_const.scatter(np.real(sampled_points[126:]), np.imag(sampled_points[126:]), s=25, c=dot_color, alpha=0.9)
     else:
         ax_const.set_title(f"GFSK Constellation ({data_pattern})", color='white', pad=10)

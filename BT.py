@@ -188,25 +188,34 @@ SPS = 8
 phase_rad = 0.0
 
 if pkt_info['mod'] == 'GFSK':
-    iq_ideal, _, = generate_gfsk(generate_bits(data_pattern, payload_symbols), sps=SPS)
+    iq_ideal, sym_ideal = generate_gfsk(generate_bits(data_pattern, payload_symbols), sps=SPS)
 elif pkt_info['mod'] == '2DH':
-    iq_ideal, _ = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 2), sps=SPS, psk_type='2DH1')
+    iq_ideal, sym_ideal = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 2), sps=SPS, psk_type='2DH1')
 elif pkt_info['mod'] == '3DH':
-    iq_ideal, _ = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 3), sps=SPS, psk_type='3DH5')
+    iq_ideal, sym_ideal = generate_edr_packet(generate_bits(data_pattern, payload_symbols * 3), sps=SPS, psk_type='3DH5')
 else:
-    iq_ideal, _, phase_rad = generate_cs_packet(target_distance, current_freq, payload_symbols, sps=SPS)
+    iq_ideal, sym_ideal, phase_rad = generate_cs_packet(target_distance, current_freq, payload_symbols, sps=SPS)
 
-# 加入 CFO
-iq_cfo = add_frequency_offset(iq_ideal, cfo_khz, fs_mhz=SPS)
+# 1. Apply Carrier Frequency Offset (CFO) to Waveform
+iq_ideal_cfo = add_frequency_offset(iq_ideal, cfo_khz, fs_mhz=SPS)
 
-# 模擬接收端：決定是否補償 CFO
+# 🛠️ 修正 1：直接對純淨的 Symbol Array 加上 CFO，避免從 Waveform 取樣造成濾波器 ISI
+# 注意時間尺度：每一個 symbol 相當於 SPS 個 samples
+n_sym = np.arange(len(sym_ideal)) * SPS
+phase_offset_sym = 2 * np.pi * (cfo_khz * 1e3) * (n_sym / (SPS * 1e6))
+sym_ideal_cfo = sym_ideal * np.exp(1j * phase_offset_sym)
+
+# 2. 模擬接收端：決定是否補償 CFO
 if enable_cfo_comp:
-    iq_processed = compensate_frequency_offset(iq_cfo, cfo_khz, fs_mhz=SPS)
+    iq_processed = compensate_frequency_offset(iq_ideal_cfo, cfo_khz, fs_mhz=SPS)
+    # 補償 Symbol
+    phase_comp_sym = -2 * np.pi * (cfo_khz * 1e3) * (n_sym / (SPS * 1e6))
+    sym_processed = sym_ideal_cfo * np.exp(1j * phase_comp_sym)
 else:
-    iq_processed = iq_cfo
+    iq_processed = iq_ideal_cfo
+    sym_processed = sym_ideal_cfo
 
-# 擷取 Symbol 時機點並加入雜訊
-sym_processed = iq_processed[::SPS]
+# 3. Apply AWGN
 iq_signal = add_awgn_noise(iq_processed, effective_snr)
 sampled_points = add_awgn_noise(sym_processed, effective_snr)
 
@@ -224,8 +233,9 @@ col_m1.metric("Modulation / Type", mod_display_name)
 col_m2.metric("Effective SNR", f"{effective_snr} dB", delta="-28 dB (Collision)" if is_collision else "Normal", delta_color="inverse" if is_collision else "normal")
 
 if pkt_info['mod'] in ['2DH', '3DH']:
-    sym_ideal_ref = generate_edr_packet(generate_bits(data_pattern, payload_symbols * (2 if pkt_info['mod']=='2DH' else 3)), sps=SPS, psk_type='2DH1' if pkt_info['mod']=='2DH' else '3DH5')[1]
-    err_vec = sampled_points[142:] - sym_ideal_ref[142:]
+    # 🛠️ 修正 2：絕對不要重新 generate_bits，直接使用最上方產生的 sym_ideal 作為完美參考點！
+    err_vec = sampled_points[142:] - sym_ideal[142:]
+    
     devm_rms, devm_peak = np.sqrt(np.mean(np.abs(err_vec)**2)) * 100, np.max(np.abs(err_vec)) * 100
     lim_rms, lim_peak = (20.0, 30.0) if pkt_info['mod'] == '2DH' else (13.0, 20.0)
     
@@ -235,7 +245,6 @@ if pkt_info['mod'] in ['2DH', '3DH']:
     
 elif pkt_info['mod'] == 'CW':
     phase_deg = np.degrees(phase_rad) % 360
-    # 若未開補償，顯示的只是平均雜訊結果，提醒使用者
     phase_label = "Measured Phase" if enable_cfo_comp else "Phase (Distorted by CFO)"
     col_m3.metric(phase_label, f"{phase_deg:.1f}°")
     col_m4.metric("Frequency", f"{current_freq} MHz")

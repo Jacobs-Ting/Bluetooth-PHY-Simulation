@@ -26,6 +26,7 @@ COLOR_SPEC = "#00E676"
 COLOR_WIFI = "#D50000"       
 COLOR_SLOT = "#B388FF"       
 COLOR_CS = "#FF4081"         
+COLOR_AFH = "#FF9100"        # 橘色 (代表 AFH 重映射)
 
 # ==========================================
 # Digital Signal Processing (DSP) Module
@@ -43,7 +44,6 @@ def add_frequency_offset(iq_signal, freq_offset_khz, fs_mhz=8):
     return iq_signal * np.exp(1j * phase_offset)
 
 def compensate_frequency_offset(iq_signal, freq_offset_khz, fs_mhz=8):
-    """模擬接收端演算法：反向旋轉補償 CFO"""
     n = np.arange(len(iq_signal))
     phase_offset = -2 * np.pi * (freq_offset_khz * 1e3) * (n / (fs_mhz * 1e6))
     return iq_signal * np.exp(1j * phase_offset)
@@ -104,7 +104,7 @@ def measure_freq_dev(bits, sps, snr, cfo_khz):
     iq_cfo = add_frequency_offset(iq_ideal, cfo_khz, fs_mhz=sps)
     iq_noisy = add_awgn_noise(iq_cfo, snr)
     inst_freq = np.diff(np.unwrap(np.angle(iq_noisy))) * (sps * 1e6) / (2 * np.pi)
-    window = np.ones(2) / 2  # 窄窗避免削平波峰
+    window = np.ones(2) / 2  
     inst_freq_smooth = np.convolve(inst_freq, window, mode='valid')
     cfo_est = np.mean(inst_freq_smooth)
     df = (np.percentile(inst_freq_smooth, 95) - np.percentile(inst_freq_smooth, 5)) / 2
@@ -118,7 +118,7 @@ PACKET_SPECS = {
 }
 
 # ==========================================
-# State Machine for FHSS Engine
+# State Machine for FHSS & AFH Engine
 # ==========================================
 if 'bt_clock' not in st.session_state: st.session_state.bt_clock = 0
 if 'hop_history' not in st.session_state: st.session_state.hop_history = []
@@ -131,9 +131,9 @@ if 'pseudo_random_seq' not in st.session_state:
 # ==========================================
 st.set_page_config(page_title="Bluetooth RF PHY Studio", layout="wide", initial_sidebar_state="expanded")
 st.title("📶 Bluetooth RF PHY Studio")
-st.markdown("### Advanced Fixed-Frequency, FHSS & Channel Sounding Simulator")
+st.markdown("### Advanced Fixed-Frequency, AFH & Channel Sounding Simulator")
 
-app_mode = st.sidebar.radio("🧪 Instrument Operating Mode", ["1️⃣ Fixed-Frequency (Baseband Spectrum)", "2️⃣ FHSS & Coexistence Simulation"])
+app_mode = st.sidebar.radio("🧪 Instrument Operating Mode", ["1️⃣ Fixed-Frequency (Baseband Spectrum)", "2️⃣ FHSS & AFH Coexistence Simulation"])
 st.sidebar.divider()
 
 st.sidebar.header("⚙️ RF Parameters")
@@ -149,37 +149,71 @@ else:
     payload_symbols = st.sidebar.number_input(f"Payload Symbols (Max: {pkt_info['max_sym']})", min_value=10, max_value=pkt_info['max_sym'], value=pkt_info['max_sym'], step=50)
 
 base_snr = st.sidebar.slider("Ambient SNR (dB)", 10, 50, 35)
-cfo_khz = st.sidebar.slider("Carrier Freq Offset (CFO) [kHz]", -150, 150, 40, step=5) # 預設給一點 CFO 看效果
+cfo_khz = st.sidebar.slider("Carrier Freq Offset (CFO) [kHz]", -150, 150, 0, step=5)
 
-# ★ 新增：接收端演算法控制
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 Receiver Baseband Logic")
-enable_cfo_comp = st.sidebar.checkbox("Enable RX CFO Compensation", value=True, help="Simulates the receiver estimating and removing CFO before analyzing the constellation/phase.")
+enable_cfo_comp = st.sidebar.checkbox("Enable RX CFO Compensation", value=True)
 
+# ==========================================
+# Coexistence & AFH Engine Logic
+# ==========================================
 is_collision = False
+is_afh_remapped = False
 effective_snr = base_snr
+raw_ch = 0
+current_ch = 0
+current_freq = 2402
 
 if "FHSS" in app_mode:
     st.sidebar.divider()
-    st.sidebar.header("📡 FHSS Engine Control")
-    if st.sidebar.button("🚀 Trigger TX (Next Hop)", type="primary", use_container_width=True):
-        st.session_state.bt_clock += pkt_info['slots'] + 1
-        st.session_state.hop_history.append(st.session_state.pseudo_random_seq[(st.session_state.bt_clock // 2) % 79])
-        if len(st.session_state.hop_history) > 12: st.session_state.hop_history.pop(0)
-
-    current_ch = st.session_state.hop_history[-1] if st.session_state.hop_history else 0
-    current_freq = 2402 + current_ch
-
-    st.sidebar.header("🔥 External Interference")
-    enable_wifi = st.sidebar.toggle("Enable Wi-Fi (802.11g/n)")
+    st.sidebar.header("🔥 Interference & AFH Control")
+    enable_wifi = st.sidebar.toggle("1. Enable Wi-Fi Interference", value=False)
     wifi_ch_name = st.sidebar.selectbox("Wi-Fi Channel", ["CH 1 (2412 MHz)", "CH 6 (2437 MHz)", "CH 11 (2462 MHz)"])
     wifi_center = int(wifi_ch_name[6:10])
+    
+    # ★ 新增：AFH 開關
+    enable_afh = st.sidebar.toggle("2. Enable AFH (Adaptive Frequency Hopping)", value=False, help="Dynamically maps out Wi-Fi interfered channels and remaps hopping sequence to safe channels.")
 
+    # 計算 AFH 的 Good / Bad Channel Map
+    good_channels = []
+    bad_channels = []
+    for ch in range(79):
+        f = 2402 + ch
+        if enable_wifi and abs(f - wifi_center) <= 10:
+            bad_channels.append(ch)
+        else:
+            good_channels.append(ch)
+
+    st.sidebar.divider()
+    st.sidebar.header("📡 FHSS TX Control")
+    if st.sidebar.button("🚀 Trigger TX (Next Hop)", type="primary", use_container_width=True):
+        st.session_state.bt_clock += pkt_info['slots'] + 1
+        # 計算原始跳頻通道
+        raw_ch_val = st.session_state.pseudo_random_seq[(st.session_state.bt_clock // 2) % 79]
+        # 套用 AFH 演算法
+        if enable_afh and raw_ch_val in bad_channels:
+            ch_to_append = good_channels[raw_ch_val % len(good_channels)]
+        else:
+            ch_to_append = raw_ch_val
+            
+        st.session_state.hop_history.append(ch_to_append)
+        if len(st.session_state.hop_history) > 12: st.session_state.hop_history.pop(0)
+
+    # 取出當前時間點的通道狀態 (供 UI 顯示)
+    raw_ch = st.session_state.pseudo_random_seq[(st.session_state.bt_clock // 2) % 79]
+    if enable_afh and raw_ch in bad_channels:
+        current_ch = good_channels[raw_ch % len(good_channels)]
+        is_afh_remapped = True
+    else:
+        current_ch = raw_ch
+        
+    current_freq = 2402 + current_ch
+
+    # 碰撞判定 (如果 AFH 開啟，這裡自然就不會發生碰撞！)
     if enable_wifi and abs(current_freq - wifi_center) <= 10:
         is_collision = True
         effective_snr = 2 
-else:
-    current_freq = 2402 
 
 # ==========================================
 # Waveform Generation & CFO & AWGN
@@ -196,26 +230,20 @@ elif pkt_info['mod'] == '3DH':
 else:
     iq_ideal, sym_ideal, phase_rad = generate_cs_packet(target_distance, current_freq, payload_symbols, sps=SPS)
 
-# 1. Apply Carrier Frequency Offset (CFO) to Waveform
 iq_ideal_cfo = add_frequency_offset(iq_ideal, cfo_khz, fs_mhz=SPS)
 
-# 🛠️ 修正 1：直接對純淨的 Symbol Array 加上 CFO，避免從 Waveform 取樣造成濾波器 ISI
-# 注意時間尺度：每一個 symbol 相當於 SPS 個 samples
 n_sym = np.arange(len(sym_ideal)) * SPS
 phase_offset_sym = 2 * np.pi * (cfo_khz * 1e3) * (n_sym / (SPS * 1e6))
 sym_ideal_cfo = sym_ideal * np.exp(1j * phase_offset_sym)
 
-# 2. 模擬接收端：決定是否補償 CFO
 if enable_cfo_comp:
     iq_processed = compensate_frequency_offset(iq_ideal_cfo, cfo_khz, fs_mhz=SPS)
-    # 補償 Symbol
     phase_comp_sym = -2 * np.pi * (cfo_khz * 1e3) * (n_sym / (SPS * 1e6))
     sym_processed = sym_ideal_cfo * np.exp(1j * phase_comp_sym)
 else:
     iq_processed = iq_ideal_cfo
     sym_processed = sym_ideal_cfo
 
-# 3. Apply AWGN
 iq_signal = add_awgn_noise(iq_processed, effective_snr)
 sampled_points = add_awgn_noise(sym_processed, effective_snr)
 
@@ -223,8 +251,12 @@ sampled_points = add_awgn_noise(sym_processed, effective_snr)
 # Dashboard Metrics
 # ==========================================
 if "FHSS" in app_mode:
-    if is_collision: st.error(f"💥 **COLLISION DETECTED!** Carrier at {current_freq} MHz (CH {current_ch}) encountered severe Wi-Fi interference.")
-    else: st.success(f"✅ **TX SUCCESS!** Carrier hopped to {current_freq} MHz (CH {current_ch}) cleanly.")
+    if is_collision: 
+        st.error(f"💥 **COLLISION DETECTED!** Carrier at {current_freq} MHz (CH {current_ch}) encountered severe Wi-Fi interference.")
+    elif is_afh_remapped:
+        st.warning(f"🛡️ **AFH INTERVENTION!** Original target {2402+raw_ch} MHz (CH {raw_ch}) was banned. Remapped to **{current_freq} MHz (CH {current_ch})**.")
+    else: 
+        st.success(f"✅ **TX SUCCESS!** Carrier hopped to {current_freq} MHz (CH {current_ch}) cleanly.")
 
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 
@@ -233,22 +265,17 @@ col_m1.metric("Modulation / Type", mod_display_name)
 col_m2.metric("Effective SNR", f"{effective_snr} dB", delta="-28 dB (Collision)" if is_collision else "Normal", delta_color="inverse" if is_collision else "normal")
 
 if pkt_info['mod'] in ['2DH', '3DH']:
-    # 🛠️ 修正 2：絕對不要重新 generate_bits，直接使用最上方產生的 sym_ideal 作為完美參考點！
     err_vec = sampled_points[142:] - sym_ideal[142:]
-    
     devm_rms, devm_peak = np.sqrt(np.mean(np.abs(err_vec)**2)) * 100, np.max(np.abs(err_vec)) * 100
     lim_rms, lim_peak = (20.0, 30.0) if pkt_info['mod'] == '2DH' else (13.0, 20.0)
-    
     devm_label = "RMS DEVM" + (" (Compensated)" if enable_cfo_comp else " (Uncompensated)")
     col_m3.metric(devm_label, f"{devm_rms:.2f} %", delta=f"Limit: {lim_rms}%", delta_color="normal" if devm_rms <= lim_rms else "inverse")
     col_m4.metric("Peak DEVM", f"{devm_peak:.2f} %", delta=f"Limit: {lim_peak}%", delta_color="normal" if devm_peak <= lim_peak else "inverse")
-    
 elif pkt_info['mod'] == 'CW':
     phase_deg = np.degrees(phase_rad) % 360
     phase_label = "Measured Phase" if enable_cfo_comp else "Phase (Distorted by CFO)"
     col_m3.metric(phase_label, f"{phase_deg:.1f}°")
     col_m4.metric("Frequency", f"{current_freq} MHz")
-    
 else:
     bits_f1 = generate_bits("11110000", 400)
     bits_f2 = generate_bits("10101010", 400)
@@ -267,8 +294,13 @@ col_chart1, col_chart2 = st.columns([1, 1.8])
 
 with col_chart1:
     fig_const, ax_const = plt.subplots(figsize=(5, 5))
-    dot_color = COLOR_SIG_BAD if is_collision else (COLOR_CS if pkt_info['mod'] == 'CW' else COLOR_SIG_GOOD)
     
+    # 決定散點圖顏色
+    if is_collision: dot_color = COLOR_SIG_BAD
+    elif is_afh_remapped: dot_color = COLOR_AFH
+    elif pkt_info['mod'] == 'CW': dot_color = COLOR_CS
+    else: dot_color = COLOR_SIG_GOOD
+        
     if pkt_info['mod'] in ['2DH', '3DH']:
         ax_const.set_title(f"PSK Constellation ({data_pattern})", color='white', pad=10)
         ax_const.scatter(np.real(sampled_points[142:]), np.imag(sampled_points[142:]), s=10, c=dot_color, alpha=0.8)
@@ -290,8 +322,13 @@ with col_chart2:
     fig_time, ax_time = plt.subplots(figsize=(10, 4.2))
     ax_time.set_title("Time Domain Envelope (Baseband)", color='white', pad=10)
     time_us = np.arange(len(iq_signal)) / SPS 
-    env_color = COLOR_SIG_BAD if is_collision else (COLOR_CS if pkt_info['mod'] == 'CW' else COLOR_ENV)
     
+    # 決定時域包絡線顏色
+    if is_collision: env_color = COLOR_SIG_BAD
+    elif is_afh_remapped: env_color = COLOR_AFH
+    elif pkt_info['mod'] == 'CW': env_color = COLOR_CS
+    else: env_color = COLOR_ENV
+        
     ax_time.plot(time_us, np.abs(iq_signal), color=env_color, linewidth=1.5, alpha=0.9)
     
     if pkt_info['mod'] == 'CW':
@@ -336,23 +373,44 @@ if "Fixed-Frequency" in app_mode:
 
 else:
     fig_hop, ax_hop = plt.subplots(figsize=(15, 3.5))
-    ax_hop.set_title("2.4 GHz ISM Band Spectrum Analyzer", color='white', pad=10)
+    ax_hop.set_title("2.4 GHz ISM Band Coexistence Analyzer", color='white', pad=10)
     freqs = 2402 + np.arange(79)
     
     ax_hop.vlines(x=freqs, ymin=0, ymax=0.05, color='#444444', linewidth=1.5)
     
     if enable_wifi:
-        ax_hop.axvspan(wifi_center - 10, wifi_center + 10, color=COLOR_WIFI, alpha=0.25)
-        ax_hop.text(wifi_center, 1.15, f"802.11 Interference ({wifi_ch_name})", color='#FF5252', fontsize=11, fontweight='bold', ha='center')
+        # 繪製 Wi-Fi 干擾區
+        ax_hop.axvspan(wifi_center - 10, wifi_center + 10, color=COLOR_WIFI, alpha=0.2)
+        
+        if enable_afh:
+            # AFH 開啟時，標示該區域被「Ban」掉 (加上交叉網格)
+            ax_hop.axvspan(wifi_center - 10, wifi_center + 10, color='none', hatch='//', edgecolor='#FF5252', alpha=0.5)
+            ax_hop.text(wifi_center, 1.15, f"Banned by AFH (Wi-Fi {wifi_ch_name[:4]})", color='#FF5252', fontsize=10, fontweight='bold', ha='center')
+        else:
+            ax_hop.text(wifi_center, 1.15, f"802.11 Interference ({wifi_ch_name})", color='#FF5252', fontsize=10, fontweight='bold', ha='center')
 
+    # 繪製歷史軌跡
     if len(st.session_state.hop_history) > 1:
         for i, ch in enumerate(st.session_state.hop_history[:-1]):
             alpha = 0.15 + (0.5 * (i / len(st.session_state.hop_history)))
             ax_hop.vlines(x=2402+ch, ymin=0, ymax=0.6, color='#2979FF', alpha=alpha, linewidth=3)
 
+    # 繪製當前載波
     if st.session_state.hop_history:
-        h_color = COLOR_SIG_BAD if is_collision else (COLOR_CS if pkt_info['mod'] == 'CW' else COLOR_SIG_GOOD)
-        ax_hop.vlines(x=current_freq, ymin=0, ymax=1.0, color=h_color, linewidth=5)
+        if is_collision: 
+            h_color = COLOR_SIG_BAD
+            hop_label = f'Collision at {current_freq} MHz!'
+        elif is_afh_remapped: 
+            h_color = COLOR_AFH
+            hop_label = f'AFH Remapped: {current_freq} MHz'
+        elif pkt_info['mod'] == 'CW':
+            h_color = COLOR_CS
+            hop_label = f'CS Tone: {current_freq} MHz'
+        else: 
+            h_color = COLOR_SIG_GOOD
+            hop_label = f'Current Hop: {current_freq} MHz'
+            
+        ax_hop.vlines(x=current_freq, ymin=0, ymax=1.0, color=h_color, linewidth=5, label=hop_label)
         ax_hop.scatter(current_freq, 1.0, color=h_color, s=80, edgecolors='white', zorder=5)
         ax_hop.text(current_freq, 1.08, f"{current_freq} MHz", color=h_color, ha='center', fontweight='bold')
 
@@ -360,5 +418,6 @@ else:
     ax_hop.set_xlabel("Frequency (MHz)")
     ax_hop.set_yticks([]) 
     ax_hop.set_xticks(np.arange(2402, 2481, 4)) 
+    ax_hop.legend(loc='upper right')
     ax_hop.grid(axis='x')
     st.pyplot(fig_hop)

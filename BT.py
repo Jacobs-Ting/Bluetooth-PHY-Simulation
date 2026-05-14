@@ -26,7 +26,7 @@ COLOR_SPEC = "#00E676"
 COLOR_WIFI = "#D50000"       
 COLOR_SLOT = "#B388FF"       
 COLOR_CS = "#FF4081"         
-COLOR_AFH = "#FF9100"        # 橘色 (代表 AFH 重映射)
+COLOR_AFH = "#FF9100"        
 
 # ==========================================
 # Digital Signal Processing (DSP) Module
@@ -172,10 +172,8 @@ if "FHSS" in app_mode:
     wifi_ch_name = st.sidebar.selectbox("Wi-Fi Channel", ["CH 1 (2412 MHz)", "CH 6 (2437 MHz)", "CH 11 (2462 MHz)"])
     wifi_center = int(wifi_ch_name[6:10])
     
-    # ★ 新增：AFH 開關
     enable_afh = st.sidebar.toggle("2. Enable AFH (Adaptive Frequency Hopping)", value=False, help="Dynamically maps out Wi-Fi interfered channels and remaps hopping sequence to safe channels.")
 
-    # 計算 AFH 的 Good / Bad Channel Map
     good_channels = []
     bad_channels = []
     for ch in range(79):
@@ -189,9 +187,7 @@ if "FHSS" in app_mode:
     st.sidebar.header("📡 FHSS TX Control")
     if st.sidebar.button("🚀 Trigger TX (Next Hop)", type="primary", use_container_width=True):
         st.session_state.bt_clock += pkt_info['slots'] + 1
-        # 計算原始跳頻通道
         raw_ch_val = st.session_state.pseudo_random_seq[(st.session_state.bt_clock // 2) % 79]
-        # 套用 AFH 演算法
         if enable_afh and raw_ch_val in bad_channels:
             ch_to_append = good_channels[raw_ch_val % len(good_channels)]
         else:
@@ -200,7 +196,6 @@ if "FHSS" in app_mode:
         st.session_state.hop_history.append(ch_to_append)
         if len(st.session_state.hop_history) > 12: st.session_state.hop_history.pop(0)
 
-    # 取出當前時間點的通道狀態 (供 UI 顯示)
     raw_ch = st.session_state.pseudo_random_seq[(st.session_state.bt_clock // 2) % 79]
     if enable_afh and raw_ch in bad_channels:
         current_ch = good_channels[raw_ch % len(good_channels)]
@@ -210,7 +205,6 @@ if "FHSS" in app_mode:
         
     current_freq = 2402 + current_ch
 
-    # 碰撞判定 (如果 AFH 開啟，這裡自然就不會發生碰撞！)
     if enable_wifi and abs(current_freq - wifi_center) <= 10:
         is_collision = True
         effective_snr = 2 
@@ -301,9 +295,32 @@ with col_chart1:
     elif pkt_info['mod'] == 'CW': dot_color = COLOR_CS
     else: dot_color = COLOR_SIG_GOOD
         
-    if pkt_info['mod'] in ['2DH', '3DH']:
-        ax_const.set_title(f"PSK Constellation ({data_pattern})", color='white', pad=10)
+    if pkt_info['mod'] == '2DH':
+        ax_const.set_title(f"π/4-DQPSK Constellation ({data_pattern})", color='white', pad=10)
+        
+        # 【關鍵修正】：直接取出所有的 Payload 符號，絕對不能加 ::SPS 導致被降採樣
+        syms = sampled_points[142:] 
+        
+        # 利用數學的 Modulo 運算來自動分類兩組星座點
+        phases = np.angle(syms)
+        mod_phases = np.mod(phases + 2 * np.pi, np.pi / 2)
+        
+        # 判斷相位是否靠近十字軸 (Set A)，或者靠近 45 度角 (Set B)
+        mask_set_a = (mod_phases < np.pi / 8) | (mod_phases > 3 * np.pi / 8)
+        mask_set_b = ~mask_set_a
+        
+        # 用兩種顏色分別畫出兩組星座點
+        ax_const.scatter(np.real(syms[mask_set_a]), np.imag(syms[mask_set_a]), 
+                         s=25, c='#FF1744', alpha=0.9, label='Set A (0, π/2, π, 3π/2)')
+        ax_const.scatter(np.real(syms[mask_set_b]), np.imag(syms[mask_set_b]), 
+                         s=25, c='#00E5FF', alpha=0.9, label='Set B (π/4, 3π/4, 5π/4, 7π/4)')
+        
+        ax_const.legend(loc='upper right', fontsize=7, facecolor='#121212', edgecolor='#333333')
+
+    elif pkt_info['mod'] == '3DH':
+        ax_const.set_title(f"8-DPSK Constellation ({data_pattern})", color='white', pad=10)
         ax_const.scatter(np.real(sampled_points[142:]), np.imag(sampled_points[142:]), s=10, c=dot_color, alpha=0.8)
+        
     elif pkt_info['mod'] == 'CW':
         ax_const.set_title(f"CS Tone Phase Vector (d={target_distance}m)", color='white', pad=10)
         circle = plt.Circle((0, 0), 1, color='#666666', fill=False, linestyle=':')
